@@ -1,0 +1,219 @@
+import pandas as pd
+import numpy as np
+from ast import literal_eval
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
+import difflib
+
+
+# 1. Data loading and preprocessing
+
+def load_and_preprocess():
+    # load datasets
+    movies = pd.read_csv('tmdb_5000_movies.csv')
+    credits = pd.read_csv('tmdb_5000_credits.csv')
+
+    # Merging datasets
+    movies = movies.merge(credits, on='title')
+
+    # Convert stringified lists to actual lists
+    def safe_literal_eval(x):
+        try:
+            return literal_eval(x)
+        except:
+            return []
+
+    # Feature Engineering
+    movies['director'] = movies['crew'].apply(
+        lambda x: next((m['name'] for m in safe_literal_eval(x) if m['job'] == 'Director'), None))
+
+    movies['year'] = pd.to_datetime(movies['release_date'], errors='coerce').dt.year
+    movies['genres'] = movies['genres'].apply(lambda x: [g['name'] for g in safe_literal_eval(x)])
+    movies['keywords'] = movies['keywords'].apply(lambda x: [k['name'] for k in safe_literal_eval(x)])
+
+    return movies.dropna(subset=['title'])
+
+
+# 2. Engine
+
+class MovieRecommender:
+    def __init__(self, df):
+        self.df = df
+        self.tfidf = TfidfVectorizer(stop_words='english')
+        self.df['soup'] = self.df.apply(self._create_soup, axis=1)
+        self.tfidf_matrix = self.tfidf.fit_transform(self.df['soup'])
+        self.cosine_sim = linear_kernel(self.tfidf_matrix, self.tfidf_matrix)
+        self.indices = pd.Series(df.index, index=df['title']).drop_duplicates()
+
+    def _create_soup(self, row):
+        keywords = ' '.join(map(str, row['keywords'])) if isinstance(row['keywords'], list) else ''
+        genres = ' '.join(map(str, row['genres'])) if isinstance(row['genres'], list) else ''
+        director = str(row['director']) if pd.notna(row['director']) else ''
+        return ' '.join([keywords, genres, director]).strip()
+
+    def get_recommendations(self, title, n=5):
+        matches = difflib.get_close_matches(title, self.indices.index, n=1, cutoff=0.6)
+        if not matches:
+            return None, None
+        idx = self.indices[matches[0]]
+        sim_scores = list(enumerate(self.cosine_sim[idx]))
+        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
+        movie_indices = [i[0] for i in sim_scores[1:n+1]]
+        return matches[0], self.df.iloc[movie_indices]
+
+
+# 3. Enhanced Movie Comparison Tool
+
+class MovieComparator:
+    def __init__(self, df):
+        self.df = df
+
+    def compare_movies(self, movie_titles, favorite_genre=None):
+        matched_titles = []
+        print("\n🔄 Matching your movies...")
+
+        for title in movie_titles:
+            # check for exact match
+            exact_matches = self.df[self.df['title'].str.lower() == title.lower()]
+
+            if not exact_matches.empty:
+                matched_title = exact_matches.iloc[0]['title']
+                print(f"✔ Exact match found for: {matched_title}")
+                matched_titles.append(matched_title)
+                continue
+
+            # showing recommendations if no exact match
+            matches = difflib.get_close_matches(title, self.df['title'], n=3, cutoff=0.4)
+
+            if not matches:
+                print(f"❌ No match found for: {title}")
+                continue
+
+            print(f"\nClose matches for '{title}':")
+            for i, match in enumerate(matches, 1):
+                print(f"{i}. {match}")
+            while True:
+                try:
+                    choice = int(input("Select the correct match (1-3) or 0 to skip: "))
+                    if choice == 0:
+                        break
+                    if 1 <= choice <= len(matches):
+                        matched_title = matches[choice-1]
+                        matched_titles.append(matched_title)
+                        break
+                except ValueError:
+                    pass
+                print("Please enter a number between 1 and 3")
+
+        if len(matched_titles) < 2:
+            print("\n⚠ Need at least 2 valid movies to compare")
+            return None, None
+
+        comparison = self.df[self.df['title'].isin(matched_titles)].copy()
+
+        # Normalize metrics to avoid division by zero
+        eps = 1e-10
+        comparison['norm_popularity'] = (comparison['popularity'] - comparison['popularity'].min()) / \
+                                      (comparison['popularity'].max() - comparison['popularity'].min() + eps)
+        comparison['norm_rating'] = comparison['vote_average'] / 10
+        comparison['norm_year'] = (comparison['year'] - 1950) / (2023 - 1950)
+
+        # Scoring system
+        comparison['score'] = (
+            0.45 * comparison['norm_rating'] +
+            0.45 * comparison['norm_popularity'] +
+            0.1 * comparison['norm_year']
+        )
+
+        if favorite_genre:
+            comparison['genre_bonus'] = comparison['genres'].apply(
+                lambda x: 0.2 if any(str(g).lower() == favorite_genre.lower() for g in x) else 0
+            )
+            comparison['score'] += comparison['genre_bonus']
+
+        # Sorting by score
+        comparison = comparison.sort_values('score', ascending=False)
+        top_movie = comparison.iloc[0]
+
+        return comparison[['title', 'year', 'vote_average', 'popularity', 'score']], top_movie
+
+
+# 4. Interactive Interface
+
+def main():
+    print("🚀 Loading movie data...")
+    try:
+        movies = load_and_preprocess()
+        recommender = MovieRecommender(movies)
+        comparator = MovieComparator(movies)
+        print("✅ Data loaded successfully!")
+    except Exception as e:
+        print(f"❌ Error loading data: {str(e)}")
+        return
+
+    while True:
+        print("\n🌟 Movie Recommendation System 🌟")
+        print("1. Get Recommendations")
+        print("2. Compare Movies")
+        print("3. Exit")
+
+        choice = input("Choose an option (1-3): ").strip()
+
+        if choice == '3':
+            print("Goodbye! 🎬")
+            break
+
+        elif choice == '1':
+            title = input("Enter a movie title: ").strip()
+            matched_title, recs = recommender.get_recommendations(title)
+
+            if not matched_title:
+                print(f"\n❌ No match found for '{title}'. Try these:")
+                print(*movies['title'].sample(5).tolist(), sep='\n')
+            else:
+                print(f"\n🎯 Recommendations similar to '{matched_title}':")
+                for i, (_, row) in enumerate(recs.iterrows(), 1):
+                    print(f"{i}. {row['title']} ({int(row['year']) if not pd.isna(row['year']) else 'N/A'})")
+                    print(f"   Rating: {row['vote_average']:.1f}/10 | Popularity: {row['popularity']:.1f}")
+                    print(f"   Genres: {', '.join(map(str, row['genres']))}\n")
+
+        elif choice == '2':
+            try:
+                num_movies = int(input("How many movies to compare? (2-5): "))
+                if not 2 <= num_movies <= 5:
+                    print("Please enter a number between 2 and 5")
+                    continue
+
+                movie_titles = [input(f"Movie {i+1} title: ").strip() for i in range(num_movies)]
+                fav_genre = input("Favorite genre for bonus (optional): ").strip() or None
+
+                comparison_df, top_movie = comparator.compare_movies(movie_titles, fav_genre)
+
+                if comparison_df is None:
+                    continue
+
+                # Print comparison results
+                print("\n🔍 Comparison Results:")
+                print(comparison_df.to_string(index=False, float_format="%.2f"))
+
+                # Print top movie details
+                print(f"\n🏆 Best Match: {top_movie['title']}")
+                print(f"   Year: {int(top_movie['year']) if not pd.isna(top_movie['year']) else 'N/A'}")
+                print(f"   Rating: {top_movie['vote_average']:.1f}/10")
+                print(f"   Popularity: {top_movie['popularity']:.1f}")
+                print(f"   Genres: {', '.join(map(str, top_movie['genres']))}")
+                print(f"   Score: {top_movie['score']:.2f}")
+
+                # Get recommendations for best match
+                _, recs = recommender.get_recommendations(top_movie['title'])
+                if recs is not None:
+                    print("\n🎬 You might also like:")
+                    for i, (_, row) in enumerate(recs.iterrows(), 1):
+                        print(f"{i}. {row['title']}")
+            except ValueError:
+                print("Please enter a valid number")
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+
+if __name__ == "__main__":
+    main()
